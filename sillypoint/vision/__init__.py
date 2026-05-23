@@ -3,13 +3,17 @@ sillypoint/vision/__init__.py
 ──────────────────────────────
 Frame sampling + object detection (YOLOv8) + umpire pose classification (MediaPipe).
 
-Samples the video at SAMPLE_FPS, runs YOLO per frame for ball detection,
-runs MediaPipe Pose per frame for umpire signal classification, then
-groups detections into per-delivery windows.
+Samples the video at SAMPLE_FPS, runs YOLO per frame for ball and stump
+detection, runs MediaPipe Pose per frame for umpire signal classification,
+then groups detections into per-delivery windows.
 
 A new delivery window begins when ball detection has been absent for
 DELIVERY_GAP seconds. Each window is extended by SIGNAL_WINDOW seconds
 after the last ball detection to capture the umpire's post-delivery signal.
+
+Class indices default to the Roboflow cricket-ball-tracking-dataset model
+(ball=0, stump=1). Override with BALL_CLASS / STUMP_CLASS env vars if using
+a different model (e.g. COCO yolov8n.pt uses ball=32, no stump class).
 
 Public API
 ----------
@@ -36,8 +40,13 @@ SIGNAL_WINDOW: float = float(os.getenv("SIGNAL_WINDOW", "3.0"))
 # Frame rate to sample at (lower = faster, still sufficient for cricket).
 SAMPLE_FPS: float = float(os.getenv("SAMPLE_FPS", "10.0"))
 
-# COCO class index for "sports ball".
-_BALL_CLASS = 32
+# Class indices for the Roboflow cricket-ball-tracking-dataset model.
+# Override via env vars when using a different model.
+_BALL_CLASS  = int(os.getenv("BALL_CLASS",  "0"))
+_STUMP_CLASS = int(os.getenv("STUMP_CLASS", "1"))
+
+# Normalised centroid displacement above which stumps are considered disturbed.
+_STUMP_DISTURB_THRESHOLD = 0.03
 
 _yolo: YOLO | None = None
 
@@ -110,8 +119,16 @@ def _classify_pose(landmarks: list) -> UmpirePoseLabel:
 # Delivery window segmentation
 # ──────────────────────────────────────────────────────────────
 
-# Internal frame record: (timestamp, ball_or_none, pose_label)
-_Frame = tuple[float, BallPosition | None, UmpirePoseLabel]
+# Internal frame record: (timestamp, ball_or_none, pose_label, stump_centroid_or_none)
+_Frame = tuple[float, BallPosition | None, UmpirePoseLabel, tuple[float, float] | None]
+
+
+def _stump_disturbed(centroids: list[tuple[float, float]]) -> bool:
+    """True if any consecutive stump centroids shifted more than the threshold."""
+    for (x1, y1), (x2, y2) in zip(centroids, centroids[1:]):
+        if ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5 > _STUMP_DISTURB_THRESHOLD:
+            return True
+    return False
 
 
 def _to_events(frames: list[_Frame]) -> list[VisualEvent]:
@@ -124,9 +141,10 @@ def _to_events(frames: list[_Frame]) -> list[VisualEvent]:
          detections exceeds DELIVERY_GAP.
       3. For each cluster, extend the time window by SIGNAL_WINDOW to
          capture the umpire's post-delivery signal.
-      4. Collect ball trajectory and dominant pose from that extended window.
+      4. Collect ball trajectory, dominant pose, and stump disturbance
+         from that extended window.
     """
-    ball_frames = [(i, t) for i, (t, ball, _) in enumerate(frames) if ball is not None]
+    ball_frames = [(i, t) for i, (t, ball, _, _) in enumerate(frames) if ball is not None]
 
     if not ball_frames:
         return []
@@ -145,15 +163,16 @@ def _to_events(frames: list[_Frame]) -> list[VisualEvent]:
 
     events: list[VisualEvent] = []
     for cluster in clusters:
-        t_start = frames[cluster[0]][0]
+        t_start    = frames[cluster[0]][0]
         t_ball_end = frames[cluster[-1]][0]
         t_window_end = t_ball_end + SIGNAL_WINDOW
 
         window_frames = [f for f in frames if t_start <= f[0] <= t_window_end]
 
-        balls  = [b for _, b, _ in window_frames if b is not None]
-        poses  = [p for _, _, p in window_frames]
-        dominant = max(set(poses), key=poses.count)
+        balls     = [b for _, b, _, _ in window_frames if b is not None]
+        poses     = [p for _, _, p, _ in window_frames]
+        stumps    = [s for _, _, _, s in window_frames if s is not None]
+        dominant  = max(set(poses), key=poses.count)
 
         events.append(VisualEvent(
             frame_start=t_start,
@@ -161,6 +180,7 @@ def _to_events(frames: list[_Frame]) -> list[VisualEvent]:
             ball_trajectory=balls,
             umpire_pose=dominant,
             umpire_signal=_POSE_TO_SIGNAL.get(dominant),
+            stump_disturbed=_stump_disturbed(stumps) if len(stumps) >= 2 else None,
         ))
 
     return events
@@ -182,7 +202,7 @@ def detect(video_path: str) -> list[VisualEvent]:
     native_fps  = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_step  = max(1, int(native_fps / SAMPLE_FPS))
 
-    frames: list[_Frame] = []
+    frames: list[_Frame] = []  # (t, ball, pose, stump_centroid)
 
     with mp.solutions.pose.Pose(
         min_detection_confidence=0.5,
@@ -199,18 +219,22 @@ def detect(video_path: str) -> list[VisualEvent]:
                 t = frame_idx / native_fps
                 h, w = frame.shape[:2]
 
-                # Ball detection
+                # Ball + stump detection in a single YOLO pass
                 ball: BallPosition | None = None
+                stump_centroid: tuple[float, float] | None = None
+
                 for box in yolo(frame, verbose=False)[0].boxes:
-                    if int(box.cls[0]) == _BALL_CLASS:
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    cls = int(box.cls[0])
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    cx, cy = (x1 + x2) / 2 / w, (y1 + y2) / 2 / h
+
+                    if cls == _BALL_CLASS and ball is None:
                         ball = BallPosition(
-                            t=t,
-                            x=(x1 + x2) / 2 / w,
-                            y=(y1 + y2) / 2 / h,
+                            t=t, x=cx, y=cy,
                             confidence=float(box.conf[0]),
                         )
-                        break  # highest-confidence ball only
+                    elif cls == _STUMP_CLASS and stump_centroid is None:
+                        stump_centroid = (cx, cy)
 
                 # Pose classification
                 rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -221,7 +245,7 @@ def detect(video_path: str) -> list[VisualEvent]:
                     else "unknown"
                 )
 
-                frames.append((t, ball, pose))
+                frames.append((t, ball, pose, stump_centroid))
 
             frame_idx += 1
 
